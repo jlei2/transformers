@@ -56,7 +56,7 @@ from .modeling_tf_utils import (
 )
 from .tokenization_utils import BatchEncoding
 from .utils import logging
-
+from .dense_einsum import DenseEinsum
 
 logger = logging.get_logger(__name__)
 
@@ -251,14 +251,57 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
         assert config.hidden_size % config.num_attention_heads == 0
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-        self.query = tf.keras.layers.Dense(
-            self.all_head_size, kernel_initializer=get_initializer(config.initializer_range), name="query"
+        self._num_heads = config.num_attention_heads
+        self._key_size = self.attention_head_size
+        self._value_size = self.attention_head_size
+        self._use_bias = True
+        self._query_dense = DenseEinsum(
+            output_shape=(self._num_heads, self._key_size),
+            use_bias=self._use_bias,
+            kernel_initializer=None,
+            bias_initializer=None,
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            activity_regularizer=None,
+            kernel_constraint=None,
+            bias_constraint=None,
+            name="query",
         )
-        self.key = tf.keras.layers.Dense(
-            self.all_head_size, kernel_initializer=get_initializer(config.initializer_range), name="key"
+        self._key_dense = DenseEinsum(
+            output_shape=(self._num_heads, self._key_size),
+            use_bias=self._use_bias,
+            kernel_initializer=None,
+            bias_initializer=None,
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            activity_regularizer=None,
+            kernel_constraint=None,
+            bias_constraint=None,
+            name="key",
         )
-        self.value = tf.keras.layers.Dense(
-            self.all_head_size, kernel_initializer=get_initializer(config.initializer_range), name="value"
+        self._value_dense = DenseEinsum(
+            output_shape=(self._num_heads, self._value_size),
+            use_bias=self._use_bias,
+            kernel_initializer=None,
+            bias_initializer=None,
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            activity_regularizer=None,
+            kernel_constraint=None,
+            bias_constraint=None,
+            name="value",
+        )
+        self._output_dense = DenseEinsum(
+            output_shape=self.all_head_size,
+            num_summed_dimensions=2,
+            kernel_initializer=None,
+            bias_initializer=None,
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            activity_regularizer=None,
+            kernel_constraint=None,
+            bias_constraint=None,
+            name="attention/output/dense",
         )
         self.dropout = tf.keras.layers.Dropout(config.attention_probs_dropout_prob)
 
@@ -269,18 +312,20 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
 
     def call(self, hidden_states, attention_mask, head_mask, output_attentions, training=False):
         batch_size = shape_list(hidden_states)[0]
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
-        query_layer = self.transpose_for_scores(mixed_query_layer, batch_size)
-        key_layer = self.transpose_for_scores(mixed_key_layer, batch_size)
-        value_layer = self.transpose_for_scores(mixed_value_layer, batch_size)
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = tf.matmul(
-            query_layer, key_layer, transpose_b=True
-        )  # (batch size, num_heads, seq_len_q, seq_len_k)
-        dk = tf.cast(shape_list(key_layer)[-1], attention_scores.dtype)  # scale attention_scores
+        query_tensor = self._query_dense(hidden_states)
+
+        # `key_tensor` = [B, S, N, H]
+        key_tensor = self._key_dense(hidden_states)
+
+        # `value_tensor` = [B, S, N, H]
+        value_tensor = self._value_dense(hidden_states)
+
+        # Take the dot product between "query" and "key" to get the raw
+        # attention scores.
+        attention_scores = tf.einsum("BSNH,BTNH->BNTS", key_tensor, query_tensor)
+
+        dk = tf.cast(self._key_size, tf.float32)  # scale attention_scores
         attention_scores = attention_scores / tf.math.sqrt(dk)
 
         if attention_mask is not None:
@@ -298,11 +343,8 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
 
-        context_layer = tf.matmul(attention_probs, value_layer)
-        context_layer = tf.transpose(context_layer, perm=[0, 2, 1, 3])
-        context_layer = tf.reshape(
-            context_layer, (batch_size, -1, self.all_head_size)
-        )  # (batch_size, seq_len_q, all_head_size)
+        attention_output = tf.einsum("BNTS,BSNH->BTNH", attention_probs, value_tensor)
+        context_layer = self._output_dense(attention_output)
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
 
         return outputs
@@ -311,14 +353,11 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
 class TFBertSelfOutput(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(
-            config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
-        )
+
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
         self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
 
     def call(self, hidden_states, input_tensor, training=False):
-        hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states, training=training)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
 
@@ -347,8 +386,18 @@ class TFBertAttention(tf.keras.layers.Layer):
 class TFBertIntermediate(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(
-            config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
+        self._intermediate_size = config.intermediate_size
+        self._intermediate_dense = DenseEinsum(
+            output_shape=self._intermediate_size,
+            activation=None,
+            kernel_initializer=None,
+            bias_initializer=None,
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            activity_regularizer=None,
+            kernel_constraint=None,
+            bias_constraint=None,
+            name="dense",
         )
 
         if isinstance(config.hidden_act, str):
@@ -357,7 +406,7 @@ class TFBertIntermediate(tf.keras.layers.Layer):
             self.intermediate_act_fn = config.hidden_act
 
     def call(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
+        hidden_states = self._intermediate_dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
 
         return hidden_states
@@ -366,14 +415,22 @@ class TFBertIntermediate(tf.keras.layers.Layer):
 class TFBertOutput(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(
-            config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
+        self._output_dense = DenseEinsum(
+            output_shape=config.hidden_size,
+            kernel_initializer=None,
+            bias_initializer=None,
+            kernel_regularizer=None,
+            bias_regularizer=None,
+            activity_regularizer=None,
+            kernel_constraint=None,
+            bias_constraint=None,
+            name="dense",
         )
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
         self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
 
     def call(self, hidden_states, input_tensor, training=False):
-        hidden_states = self.dense(hidden_states)
+        hidden_states = self._output_dense(hidden_states)
         hidden_states = self.dropout(hidden_states, training=training)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
 
