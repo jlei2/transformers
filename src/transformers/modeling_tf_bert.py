@@ -57,6 +57,7 @@ from .modeling_tf_utils import (
 from .tokenization_utils import BatchEncoding
 from .utils import logging
 
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BertConfig"
@@ -703,7 +704,7 @@ class TFBertMainLayer(tf.keras.layers.Layer):
         else:
             head_mask = [None] * self.num_hidden_layers
             # head_mask = tf.constant([0] * self.num_hidden_layers)
-        print(embedding_output.shape)
+
         encoder_outputs = self.encoder(
             embedding_output,
             extended_attention_mask,
