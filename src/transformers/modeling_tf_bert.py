@@ -95,7 +95,7 @@ def gelu(x):
         0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
         Also see https://arxiv.org/abs/1606.08415
     """
-    cdf = 0.5 * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
+    cdf = 0.5 * (1.0 + tf.math.erf(x / tf.constant(2.0, dtype=tf.keras.mixed_precision.experimental.global_policy().compute_dtype)))
 
     return x * cdf
 
@@ -350,7 +350,12 @@ class TFBertIntermediate(tf.keras.layers.Layer):
         self.dense = tf.keras.layers.Dense(
             config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
-
+        ACT2FN = {
+        "gelu": tf.keras.layers.Activation(gelu),
+        "relu": tf.keras.activations.relu,
+        "swish": tf.keras.layers.Activation(swish),
+        "gelu_new": tf.keras.layers.Activation(gelu_new),
+        }
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
